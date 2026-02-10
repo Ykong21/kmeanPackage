@@ -33,7 +33,7 @@
 #' y <- x[, 1] - 2 * x[, 2] + rnorm(N)
 #' x0s <- matrix(rnorm(10 * p), 10, p)
 #' y0s <- x0s[, 1] - 2 * x0s[, 2]
-#' out <- kmeanresample(
+#' out <- kr_boot(
 #'   N = N, n = 20, B = 5,
 #'   x = x, y = y,
 #'   x0s = x0s, y0s = y0s,
@@ -42,7 +42,7 @@
 #' out$Ave_MSE
 #'
 #' @export
-kmeanresample <- function(N, n, B, x, y, x0s, y0s, lambda0) {
+kr_boot <- function(N, n, B, x, y, x0s, y0s, lambda0) {
   
   # ---- coerce types (non-invasive) ----
   x <- as.matrix(x)
