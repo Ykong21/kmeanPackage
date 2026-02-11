@@ -1,30 +1,19 @@
-#' KernelReSample
+#' KernelReSample: sampling probabilities for each test point
 #'
-#' Advanced kernel resampling estimator.
-#' Provides configurable (i) clustering to build selection weights and
-#' (ii) kernel family + bandwidth rules for both center-stage selection and
-#' bootstrap-resample KRR estimation.
+#' Implements ONLY the sampling (selection) part used in \code{kr_boot_plus}:
+#' (1) clustering on training X to get centers,
+#' (2) compute center labels ystar (cluster mean of y),
+#' (3) tune lambda (and optionally bw_scale) on centers by BIC,
+#' (4) for each test point x0: compute center weights and induce train-point probs.
 #'
-#' Key design
-#' - Compute centers once (clustering on full training X).
-#' - Compute a center-stage bandwidth (rho/ell) for *selection weights* only.
-#' - Tune lambda by default (BIC on centers); optionally joint tune (bw_scale, lambda).
-#' - For each test point x0: compute sampling probs using centers.
-#' - For each bootstrap draw: resample indices with replacement and recompute
-#'   the *subset* bandwidth on that resample, then do accurate KRR via Cholesky.
-#'
-#' Bandwidth units are handled cleanly by kernel type:
-#' - Gaussian: exp(-||x-y||^2 / rho)     -> rho is squared-distance scale
-#' - Laplace:  exp(-||x-y|| / ell)       -> ell is distance scale
-#' - Matern:   uses distance/ell         -> ell is distance scale
+#' This function does NOT fit any estimator (no KRR / no FALKON). It returns
+#' sampling probabilities (and optionally centers-level weights) that can be
+#' used by any downstream estimator.
 #'
 #' @param N Integer. Number of training points (must equal nrow(x)).
-#' @param n Integer. Bootstrap resample size per draw.
-#' @param B Integer. Number of bootstrap draws.
 #' @param x Matrix. Training covariates (N x p).
-#' @param y Numeric. Training responses (length N).
+#' @param y Numeric. Training responses (length N). Used to compute center labels for BIC tuning.
 #' @param x0s Matrix. Test covariates (m x p).
-#' @param y0s Numeric. Test responses (length m), used only for MSE reporting.
 #' @param lambda0 Numeric vector. Candidate lambdas for BIC tuning on centers.
 #'
 #' @param kernel Kernel family: "gaussian" (default), "laplace", "matern".
@@ -32,30 +21,35 @@
 #'
 #' @param clustering Clustering for centers: "kmeans" (default), "kmeans_pp",
 #'   "kmeans_rp", or "kmedoids".
-#' @param n_centers Integer. Number of centers/clusters used for selection weights (default = n).
+#' @param n_centers Integer. Number of centers/clusters used for selection weights (default = 200).
 #' @param kmeans_maxiter Integer. Max iterations for kmeans backends.
 #' @param rp_dim Integer. Random projection dimension for "kmeans_rp".
 #'
-#' @param bw_centers_method Bandwidth rule for *centers* (selection weights):
-#'   "detcov" (default) or "median".
+#' @param bw_centers_method Bandwidth rule for *centers* (selection weights): "median" (default) or "detcov".
 #' @param bw_scope Scope for centers bandwidth when bw_centers_method is used:
 #'   "centers" (default) uses centers; "train_sample" uses a subsample of X.
 #' @param bw_train_sample Integer. Subsample size if bw_scope="train_sample".
 #' @param tune_bw Logical. If TRUE, allow bw_scales for centers bandwidth.
 #' @param bw_scales Numeric. Multiplicative scales applied to centers bandwidth in tuning.
 #'
-#' @param bw_subset_method Bandwidth rule for *subset* bandwidth on each bootstrap resample:
-#'   "detcov" (default) or "median".
-#'
 #' @param joint_tune Logical. If TRUE and tune_bw=TRUE, joint tune (bw_scale, lambda) by BIC.
 #'   If FALSE (default), tune lambda only (bw fixed at base value).
+#'
+#' @param normalize_cols Logical. If TRUE (default), normalize each column of the returned
+#'   sampling matrix \code{finalprobs} to sum to 1 (so each column is a valid probability vector).
+#'
+#' @param return Character. What to return:
+#'   - "probs": N x m sampling probabilities (default).
+#'   - "weights": n_centers x m center weights W (normalized by column).
+#'   - "both": both probs and weights.
+#'   - "prep": return a prep object containing centers/idx/A_W/bw/lambda, useful if you want to reuse for new x0s.
 #' @param verbose Logical. Print progress messages.
 #'
-#' @return A list with fields:
-#'   - y0s, est (m x 1), MSE (length m), Ave_MSE
-#'   - lambda_opt, bw_centers, bw_centers_method, bw_subset_method
-#'   - clustering, kernel, matern_nu (if applicable)
-#'   - timing (named list of elapsed seconds)
+#' @return A list containing requested outputs and metadata:
+#'   - finalprobs (N x m) if return includes probs
+#'   - W (n_centers x m) if return includes weights
+#'   - idx, centers, lambda_opt, bw_centers, kernel, clustering, etc.
+#'   - timing (elapsed seconds for cluster/ystar/tune/weights/total)
 #'
 #' @examples
 #' set.seed(1)
@@ -63,55 +57,75 @@
 #' p <- 3
 #' x <- matrix(rnorm(N * p), N, p)
 #' y <- x[, 1] - 2 * x[, 2] + rnorm(N)
-#' x0s <- matrix(rnorm(10 * p), 10, p)
-#' y0s <- x0s[, 1] - 2 * x0s[, 2]
+#' m <- 10
+#' x0s <- matrix(rnorm(m * p), m, p)
 #' lambda0 <- 10^seq(-2, 2, length.out = 10)
-#' out <- kr_boot_plus(
-#'   N = N, n = 200, B = 5,
-#'   x = x, y = y,
-#'   x0s = x0s, y0s = y0s,
-#'   lambda0 = lambda0,
+#'
+#' # 1) Return sampling probabilities (N x m)
+#' samp <- kr_sampling(
+#'   N = N, x = x, y = y, x0s = x0s, lambda0 = lambda0,
 #'   kernel = "gaussian",
+#'   clustering = "kmeans",
+#'   n_centers = 50,
 #'   bw_centers_method = "median",
-#'   bw_subset_method = "median"
+#'   normalize_cols = TRUE,
+#'   return = "probs"
 #' )
-#' out$Ave_MSE
+#' dim(samp$finalprobs)               # N x m
+#' range(colSums(samp$finalprobs))    # ~ 1
+#'
+#' # Draw one bootstrap-resample index set for the first test point
+#' probs1 <- samp$finalprobs[, 1]
+#' idx_sub <- sample.int(N, size = 200, replace = TRUE, prob = probs1)
+#' head(idx_sub)
+#'
+#' # 2) Return both probs and center weights
+#' samp2 <- kr_sampling(
+#'   N = N, x = x, y = y, x0s = x0s, lambda0 = lambda0,
+#'   kernel = "laplace",
+#'   clustering = "kmeans_pp",
+#'   n_centers = 50,
+#'   normalize_cols = TRUE,
+#'   return = "both"
+#' )
+#' dim(samp2$W)          # n_centers x m
+#' dim(samp2$finalprobs) # N x m
+#'
+#' # 3) Return a prep object (centers/tuning results) for reuse
+#' prep <- kr_sampling(
+#'   N = N, x = x, y = y, x0s = x0s, lambda0 = lambda0,
+#'   n_centers = 50,
+#'   return = "prep"
+#' )
+#' names(prep)
 #'
 #' @export
-kr_boot_plus <- function(
-    N, n, B, x, y, x0s, y0s, lambda0,
+kr_sampling <- function(
+    N, x, y, x0s, lambda0,
     kernel = c("gaussian","laplace","matern"),
     matern_nu = c(0.5, 1.5, 2.5),
     clustering = c("kmeans","kmeans_pp","kmeans_rp","kmedoids"),
-    n_centers = n,
+    n_centers = 200,
     kmeans_maxiter = 50,
     rp_dim = 24,
-
-    # bandwidth (CENTERS): used only for selection weights
     bw_centers_method = c("median", "detcov"),
     bw_scope = c("centers","train_sample"),
     bw_train_sample = 2000,
     tune_bw = FALSE,
     bw_scales = c(0.25, 0.5, 1, 2),
-
-    # bandwidth (SUBSET): recomputed on each bootstrap resample
-    bw_subset_method = c("median","detcov"),
-
-    # tuning
     joint_tune = FALSE,
+    normalize_cols = TRUE,
+    return = c("probs","weights","both","prep"),
     verbose = FALSE
 ) {
   # ---- coerce types ----
   x <- as.matrix(x); x0s <- as.matrix(x0s)
-  y <- as.numeric(y); y0s <- as.numeric(y0s)
+  y <- as.numeric(y)
 
   # ---- checks ----
   if (nrow(x) != N) stop("N must equal nrow(x).")
   if (length(y) != N) stop("y must have length N.")
-  if (n <= 0 || n > N) stop("n must be in {1,...,N}.")
-  if (B <= 0) stop("B must be positive.")
   if (ncol(x0s) != ncol(x)) stop("x0s must have same number of columns as x.")
-  if (length(y0s) != nrow(x0s)) stop("y0s must have length nrow(x0s).")
   if (!is.numeric(lambda0) || length(lambda0) < 1) stop("lambda0 must be a numeric vector.")
   if (!is.numeric(n_centers) || length(n_centers) != 1 || n_centers < 2) stop("n_centers must be an integer >= 2.")
 
@@ -119,8 +133,8 @@ kr_boot_plus <- function(
   matern_nu <- as.numeric(match.arg(as.character(matern_nu), as.character(c(0.5,1.5,2.5))))
   clustering <- match.arg(clustering)
   bw_centers_method <- match.arg(bw_centers_method)
-  bw_subset_method <- match.arg(bw_subset_method)
   bw_scope <- match.arg(bw_scope)
+  return <- match.arg(return)
 
   n_centers <- min(as.integer(n_centers), N)
 
@@ -128,9 +142,8 @@ kr_boot_plus <- function(
   t_all <- proc.time()
 
   # =========================
-  # Helpers
+  # Helpers (copied from kr_boot_plus)
   # =========================
-
   detcov_safe <- function(Z) {
     Z <- as.matrix(Z)
     if (nrow(Z) < 2) return(1)
@@ -140,7 +153,6 @@ kr_boot_plus <- function(
     d
   }
 
-  # median of pairwise distances (distance units)
   median_dist <- function(Z, max_m = 2000L) {
     Z <- as.matrix(Z)
     m <- nrow(Z)
@@ -149,19 +161,13 @@ kr_boot_plus <- function(
     stats::median(as.numeric(stats::dist(Z)))
   }
 
-  # Bandwidth (rho/ell) from points:
-  # - Gaussian needs squared-distance scale rho
-  # - Laplace/Matern need distance scale ell
   bw_from_points <- function(Z, method, kernel, max_m = 2000L) {
     Z <- as.matrix(Z)
     if (method == "detcov") {
       d <- detcov_safe(Z)
       if (kernel == "gaussian") {
-        # original logic: rho in squared-distance scale
         return(max(d, 1e-12))
       } else {
-        # convert volume-like det(cov) to distance scale:
-        # det(cov) ~ (scale^2)^p -> scale ~ det(cov)^(1/(2p))
         p <- ncol(Z)
         return(max(d^(1/(2 * p)), 1e-12))
       }
@@ -172,7 +178,6 @@ kr_boot_plus <- function(
     }
   }
 
-  # Pairwise squared distances
   sqdist <- function(A, B) {
     A <- as.matrix(A); B <- as.matrix(B)
     AA <- rowSums(A^2)
@@ -182,42 +187,35 @@ kr_boot_plus <- function(
     D2
   }
 
-  # Kernel matrix with proper bandwidth semantics per kernel
   kernel_mat <- function(A, B, bw) {
     D2 <- sqdist(A, B)
     if (kernel == "gaussian") {
-      # exp(-||x-y||^2 / rho)
       return(exp(-D2 / max(bw, 1e-12)))
     }
     D <- sqrt(D2)
     ell <- max(bw, 1e-12)
     if (kernel == "laplace") {
-      # exp(-||x-y|| / ell)
       return(exp(-D / ell))
     }
-    # matern
     if (matern_nu == 0.5) {
       return(exp(-D / ell))
     } else if (matern_nu == 1.5) {
       s <- sqrt(3) * D / ell
       return((1 + s) * exp(-s))
-    } else { # 2.5
+    } else {
       s <- sqrt(5) * D / ell
       return((1 + s + (s^2)/3) * exp(-s))
     }
   }
 
-  # SPD solve via Cholesky: (t(R)R)x=b (chol returns upper R)
   chol_solve_spd <- function(A, b) {
     R <- chol(A)
     backsolve(R, forwardsolve(t(R), b))
   }
 
   # ---------------------------
-  # Clustering backends
+  # Clustering backends (copied)
   # ---------------------------
-
-  # Simple kmeans++ seeding
   kmeanspp_seed <- function(X, k) {
     X <- as.matrix(X)
     N0 <- nrow(X)
@@ -251,8 +249,8 @@ kr_boot_plus <- function(
     } else if (clustering == "kmeans_rp") {
       p <- ncol(X)
       q <- min(as.integer(rp_dim), p)
-      R <- matrix(stats::rnorm(p * q), p, q) / sqrt(q)
-      Z <- X %*% R
+      Rr <- matrix(stats::rnorm(p * q), p, q) / sqrt(q)
+      Z <- X %*% Rr
       km <- stats::kmeans(Z, centers = k, iter.max = kmeans_maxiter)
       idx <- km$cluster
       centers <- matrix(0, k, p)
@@ -273,9 +271,8 @@ kr_boot_plus <- function(
   }
 
   # ---------------------------
-  # Center-stage tuning via BIC
+  # Center-stage tuning via BIC (copied)
   # ---------------------------
-
   tune_lambda_bw_centers <- function(centers, ystar, base_bw, lambda_grid, scales, joint) {
     best <- list(score = Inf, lam = lambda_grid[1], bw = base_bw)
 
@@ -296,7 +293,6 @@ kr_boot_plus <- function(
         res2 <- max(sum(resid^2), .Machine$double.eps)
         df <- sum(frac)
         bic <- nrow(centers) * log(res2) + log(nrow(centers)) * df
-
         if (bic < best$score) best <- list(score = bic, lam = lam, bw = bw_try)
       }
 
@@ -308,7 +304,7 @@ kr_boot_plus <- function(
   # =========================
   # 1) clustering
   # =========================
-  if (verbose) message("[kr_boot_plus] clustering...")
+  if (verbose) message("[kr_sampling] clustering...")
   cl <- do_clustering(x, n_centers)
   idx <- as.integer(cl$idx)
   centers <- as.matrix(cl$centers)
@@ -316,7 +312,7 @@ kr_boot_plus <- function(
   # =========================
   # 2) ystar per center (cluster-mean y)
   # =========================
-  if (verbose) message("[kr_boot_plus] center labels (cluster means)...")
+  if (verbose) message("[kr_sampling] center labels (cluster means)...")
   t0 <- proc.time()
 
   counts <- tabulate(idx, nbins = n_centers)
@@ -332,7 +328,7 @@ kr_boot_plus <- function(
   # =========================
   # 3) choose centers bandwidth + lambda (BIC)
   # =========================
-  if (verbose) message("[kr_boot_plus] tuning lambda (and optionally bw_scale) on centers...")
+  if (verbose) message("[kr_sampling] tuning lambda (and optionally bw_scale) on centers...")
   t0 <- proc.time()
 
   base_bw <- if (bw_scope == "centers") {
@@ -359,7 +355,7 @@ kr_boot_plus <- function(
   # =========================
   # 4) weights/probs (centers bw only)
   # =========================
-  if (verbose) message("[kr_boot_plus] computing sampling probabilities...")
+  if (verbose) message("[kr_sampling] computing sampling probabilities...")
   t0 <- proc.time()
 
   KC <- kernel_mat(centers, centers, bw_centers)
@@ -368,78 +364,71 @@ kr_boot_plus <- function(
   tau <- 1 / lambda_opt
   A_W <- diag(n_centers) + tau * KC
 
-  # Kxc is m x n_centers
-  Kxc <- kernel_mat(x0s, centers, bw_centers)
-  # Solve A_W^{-1} * Kxc^T -> n_centers x m
-  Kx0s <- chol_solve_spd(A_W, t(Kxc))
+  Kxc <- kernel_mat(x0s, centers, bw_centers)     # m x n_centers
+  Kx0s <- chol_solve_spd(A_W, t(Kxc))             # n_centers x m
 
   W <- abs(Kx0s)
-  cs <- colSums(W); cs[cs <= 0] <- 1
-  W <- sweep(W, 2, cs, "/")
+  csW <- colSums(W); csW[csW <= 0] <- 1
+  W <- sweep(W, 2, csW, "/")
 
-  # cluster-to-point mapping
   finalweights <- (n_centers / N) * W
   finalprobs <- finalweights[idx, , drop = FALSE]  # N x m
 
-  timing$weights <- (proc.time() - t0)[3]
-
-  # =========================
-  # 5) bootstrap estimation (subset bw recomputed per resample)
-  # =========================
-  if (verbose) message("[kr_boot_plus] bootstrap KRR...")
-  t0 <- proc.time()
-
-  m <- nrow(x0s)
-  fx0s <- matrix(0, B, m)
-
-  for (e in 1:m) {
-    probs <- finalprobs[, e]
-    probs[!is.finite(probs) | probs < 0] <- 0
-    s <- sum(probs)
-    if (!is.finite(s) || s <= 0) probs <- rep(1 / N, N) else probs <- probs / s
-
-    for (b in 1:B) {
-      # WITH replacement (matches your original)
-      XIND <- sample.int(N, n, replace = TRUE, prob = probs)
-      xsub <- x[XIND, , drop = FALSE]
-      ysub <- y[XIND]
-
-      # subset bandwidth recomputed on THIS resample
-      bw_sub <- bw_from_points(xsub, bw_subset_method, kernel)
-
-      Kss <- kernel_mat(xsub, xsub, bw_sub)
-      Kss <- (Kss + t(Kss)) / 2 + 1e-10 * diag(n)
-
-      A <- diag(n) + tau * Kss
-      rhs <- tau * ysub
-      a <- chol_solve_spd(A, rhs)
-
-      k0 <- kernel_mat(xsub, matrix(x0s[e, ], 1, ncol(xsub)), bw_sub) # n x 1
-      fx0s[b, e] <- drop(t(k0) %*% a)
-    }
+  if (isTRUE(normalize_cols)) {
+    cs <- colSums(finalprobs)
+    cs[!is.finite(cs) | cs <= 0] <- 1
+    finalprobs <- sweep(finalprobs, 2, cs, "/")
   }
 
-  est <- matrix(colMeans(fx0s), m, 1)
-  mse <- (y0s - est[, 1])^2
-  Ave_MSE <- mean(mse)
-
-  timing$est <- (proc.time() - t0)[3]
+  timing$weights <- (proc.time() - t0)[3]
   timing$total <- (proc.time() - t_all)[3]
 
-  list(
-    y0s = y0s,
-    est = est,
-    MSE = mse,
-    Ave_MSE = Ave_MSE,
-    lambda_opt = lambda_opt,
-    bw_centers = bw_centers,
-    bw_centers_method = bw_centers_method,
-    bw_subset_method = bw_subset_method,
-    clustering = clustering,
+  # ---- return control ----
+  if (return == "prep") {
+    return(list(
+      idx = idx,
+      centers = centers,
+      ystar = ystar,
+      kernel = kernel,
+      matern_nu = if (kernel == "matern") matern_nu else NULL,
+      clustering = clustering,
+      n_centers = n_centers,
+      bw_centers = bw_centers,
+      bw_centers_method = bw_centers_method,
+      bw_scope = bw_scope,
+      lambda_opt = lambda_opt,
+      tau = tau,
+      A_W = A_W,
+      normalize_cols = normalize_cols,
+      timing = timing
+    ))
+  }
+
+  out <- list(
+    idx = idx,
+    centers = centers,
     kernel = kernel,
     matern_nu = if (kernel == "matern") matern_nu else NULL,
+    clustering = clustering,
+    n_centers = n_centers,
+    bw_centers = bw_centers,
+    bw_centers_method = bw_centers_method,
+    bw_scope = bw_scope,
+    lambda_opt = lambda_opt,
+    tau = tau,
+    normalize_cols = normalize_cols,
     timing = timing
   )
+
+  if (return == "weights") {
+    out$W <- W
+    return(out)
+  }
+  if (return == "both") {
+    out$W <- W
+    out$finalprobs <- finalprobs
+    return(out)
+  }
+  out$finalprobs <- finalprobs
+  out
 }
-
-
